@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/almeidapaulopt/tsdproxy/internal/config"
@@ -58,6 +59,7 @@ type (
 		log               zerolog.Logger
 		ctx               context.Context
 		tracerProvider    trace.TracerProvider
+		propagator        propagation.TextMapPropagator
 		tlsLifecycle      *tlsproviders.LifecycleManager
 		webhookSender     *webhook.Sender
 		cfg               *config.Data
@@ -93,7 +95,17 @@ var (
 )
 
 // NewProxyManager function creates a new ProxyManager.
-func NewProxyManager(logger zerolog.Logger, cfg *config.Data, proxyAuthToken string, tp trace.TracerProvider, assets *web.Assets) *ProxyManager {
+// The propagator is threaded explicitly (rather than read from the global) so
+// W3C trace-context injection into upstream requests does not depend on global
+// state — see core.InitTracer.
+func NewProxyManager(
+	logger zerolog.Logger,
+	cfg *config.Data,
+	proxyAuthToken string,
+	tp trace.TracerProvider,
+	prop propagation.TextMapPropagator,
+	assets *web.Assets,
+) *ProxyManager {
 	ctx, cancel := context.WithCancel(context.Background())
 	pm := &ProxyManager{
 		ctx:               ctx,
@@ -111,6 +123,7 @@ func NewProxyManager(logger zerolog.Logger, cfg *config.Data, proxyAuthToken str
 		metrics:           metrics.New(nil),
 		certExpiryRefresh: defaultCertExpiryRefreshInterval,
 		tracerProvider:    tp,
+		propagator:        prop,
 		webhookSender:     webhook.NewSender(logger, cfg.Webhooks),
 		assets:            assets,
 		targetLocks:       newKeyedLocks(),
@@ -411,6 +424,7 @@ func (pm *ProxyManager) buildProxy(proxyConfig *model.Config, proxyProvider prox
 		ProxyProvider:  proxyProvider,
 		Metrics:        pm.metrics,
 		TracerProvider: pm.tracerProvider,
+		Propagator:     pm.propagator,
 		HTTPPort:       pm.cfg.HTTP.Port,
 		ProxyAuthToken: pm.proxyAuthToken,
 	})

@@ -19,7 +19,7 @@ import (
 // -- NewProxyManager -----------------------------------------------------------
 
 func TestNewProxyManager(t *testing.T) {
-	pm := NewProxyManager(zerolog.Nop(), config.NewTestData("", ""), "test-token", nil, web.NewAssets("", "", "sh", false))
+	pm := NewProxyManager(zerolog.Nop(), config.NewTestData("", ""), "test-token", nil, nil, web.NewAssets("", "", "sh", false))
 
 	if pm.Proxies == nil {
 		t.Fatal("expected Proxies map to be initialized")
@@ -292,7 +292,7 @@ func TestNewProxyManager_Start(t *testing.T) {
 		prometheus.DefaultGatherer = oldGatherer
 	})
 
-	pm := NewProxyManager(zerolog.Nop(), config.NewTestData("", ""), "test-token", nil, nil)
+	pm := NewProxyManager(zerolog.Nop(), config.NewTestData("", ""), "test-token", nil, nil, nil)
 	if err := pm.Start(); err == nil {
 		t.Fatal("expected error when no providers are configured")
 	}
@@ -309,7 +309,7 @@ func TestMetricsHandler(t *testing.T) {
 		prometheus.DefaultGatherer = oldGatherer
 	})
 
-	pm := NewProxyManager(zerolog.Nop(), config.NewTestData("", ""), "test-token", nil, nil)
+	pm := NewProxyManager(zerolog.Nop(), config.NewTestData("", ""), "test-token", nil, nil, nil)
 
 	h := pm.MetricsHandler()
 	if h == nil {

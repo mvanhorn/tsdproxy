@@ -30,6 +30,7 @@ func (proxy *Proxy) initPorts() {
 				PortName:         k,
 				LogBuffer:        proxy.logBuffer,
 				TracerProvider:   proxy.tracerProvider,
+				Propagator:       proxy.propagator,
 				HTTPPort:         proxy.httpPort,
 				ProxyAuthToken:   proxy.proxyAuthToken,
 				AccessLog:        proxy.Config.ProxyAccessLog,

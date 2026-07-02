@@ -4,6 +4,7 @@
 package proxymanager
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -26,6 +27,9 @@ import (
 
 	"github.com/rs/zerolog"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -45,6 +49,18 @@ const (
 	// Protects against memory-amplification via giant headers.
 	maxHTTPHeaderBytes = 1 << 20 // 1 MiB
 	canonicalLoopback  = "127.0.0.1"
+
+	// Span attribute keys attached to proxy server spans. These are tsdproxy-
+	// specific (not part of the OTel HTTP semantic conventions, which the
+	// otelhttp handler already adds). They let dashboards filter/group traces
+	// by the same dimensions Prometheus metrics already expose
+	// (tsdproxy_proxy_*), plus the resolved tailnet user and the target
+	// container — useful for attributing latency to a specific backend.
+	spanAttrProxyName    = "tsdproxy.proxy.name"
+	spanAttrPortName     = "tsdproxy.proxy.port"
+	spanAttrTarget       = "tsdproxy.proxy.target"
+	spanAttrTailnetUser  = "tsdproxy.user.id"
+	spanAttrTailnetLogin = "tsdproxy.user.username"
 )
 
 type port struct {
@@ -223,11 +239,114 @@ func proxyRewrite(
 	}
 }
 
+// spanAttrsMiddleware annotates the active server span with tsdproxy-specific
+// attributes. It is wired INSIDE otelhttp.NewHandler so the span exists in the
+// request context by the time this runs.
+//
+// Static attributes (proxy name, port name, target host:port) are set up-front
+// — they are constant for the port's lifetime. The tailnet user (resolved by
+// WhoisMiddleware) and the final HTTP status code are set after the inner
+// handler returns. Status is mirrored onto the span as an attribute in addition
+// to the otelhttp default http.response.status_code, so failed upstreams are
+// searchable even when the server span itself stays UNSET (e.g. a 502 from the
+// reverse-proxy ErrorHandler before any container response).
+func spanAttrsMiddleware(proxyName, portName string, target *url.URL) func(http.Handler) http.Handler {
+	staticAttrs := []attribute.KeyValue{
+		attribute.String(spanAttrProxyName, proxyName),
+		attribute.String(spanAttrPortName, portName),
+	}
+	if target != nil {
+		staticAttrs = append(staticAttrs, attribute.String(spanAttrTarget, target.Host))
+	}
+
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Stamp static attrs on the server span before the inner handler
+			// runs, so they appear even on early returns / panics.
+			if span := trace.SpanFromContext(r.Context()); span.SpanContext().IsValid() {
+				span.SetAttributes(staticAttrs...)
+
+				// Tailnet identity was resolved by WhoisMiddleware (innermost)
+				// and stashed in context. Attach it to the span so individual
+				// user traffic can be isolated in the backend.
+				if user, ok := model.WhoisFromContext(r.Context()); ok && user.ID != "" {
+					span.SetAttributes(
+						attribute.String(spanAttrTailnetUser, user.ID),
+						attribute.String(spanAttrTailnetLogin, user.Username),
+					)
+				}
+			}
+
+			rec := &spanStatusRecorder{ResponseWriter: w, statusCode: http.StatusOK}
+			next.ServeHTTP(rec, r)
+
+			// Escalate 5xx to span status ERROR. otelhttp already sets
+			// http.response.status_code and its own status mapping, but a 502
+			// written by the reverse-proxy ErrorHandler (e.g. container down)
+			// happens inside the inner handler chain, before otelhttp inspects
+			// the response — mirroring the 5xx→ERROR mapping here guarantees
+			// failed upstreams are flagged regardless of which layer wrote the
+			// response.
+			if rec.statusCode >= http.StatusInternalServerError {
+				if span := trace.SpanFromContext(r.Context()); span.SpanContext().IsValid() {
+					span.SetStatus(codes.Error, http.StatusText(rec.statusCode))
+				}
+			}
+		})
+	}
+}
+
+// spanStatusRecorder captures the response status code so spanAttrsMiddleware
+// can attach it to the server span. It proxies Flush/Hijack/Unwrap to the
+// underlying writer so SSE streaming (FlushInterval: -1) and connection
+// upgrades keep working — the recorder sits innermost, directly wrapping the
+// real ResponseWriter the reverse proxy flushes through.
+type spanStatusRecorder struct {
+	http.ResponseWriter
+	statusCode int
+	written    bool
+}
+
+func (r *spanStatusRecorder) WriteHeader(code int) {
+	if !r.written {
+		r.statusCode = code
+		r.written = true
+	}
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *spanStatusRecorder) Write(b []byte) (int, error) {
+	if !r.written {
+		r.statusCode = http.StatusOK
+		r.written = true
+	}
+	return r.ResponseWriter.Write(b)
+}
+
+func (r *spanStatusRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (r *spanStatusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h, ok := r.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, core.ErrHijackNotSupported
+	}
+	return h.Hijack()
+}
+
+func (r *spanStatusRecorder) Unwrap() http.ResponseWriter {
+	return r.ResponseWriter
+}
+
 // portProxyParams holds all parameters for creating a new HTTP/HTTPS port proxy.
 type portProxyParams struct {
 	Log              zerolog.Logger
 	Ctx              context.Context
 	TracerProvider   trace.TracerProvider
+	Propagator       propagation.TextMapPropagator
 	Metrics          *metrics.Metrics
 	WhoisMiddleware  func(next http.Handler) http.Handler
 	LogBuffer        *LogRingBuffer
@@ -266,8 +385,36 @@ func newPortProxy(p portProxyParams) *port {
 	// strconv.FormatUint in the hot path saves an allocation per request.
 	httpPortStr := strconv.FormatUint(uint64(p.HTTPPort), 10)
 
+	// upstreamTransport wraps the bare *http.Transport in otelhttp so each
+	// request forwarded to the container becomes a child CLIENT span of the
+	// inbound server span. Two effects:
+	//   1. Trace latency splits into "tsdproxy overhead" vs "container time".
+	//   2. The W3C traceparent header is injected into the outbound request,
+	//      so an instrumented upstream (e.g. openobserve) emits a SERVER span
+	//      that nests under this proxy chain instead of starting an orphan.
+	// Only applied when tracing is enabled — otherwise otelhttp would still
+	// propagate context but create no-op spans (cheap, but pointless).
+	var roundTripper http.RoundTripper = tr
+	if p.TracerProvider != nil {
+		transportOpts := []otelhttp.Option{
+			otelhttp.WithTracerProvider(p.TracerProvider),
+			// Name the upstream span after the configured target so it reads
+			// e.g. "GET 127.0.0.1:8080" rather than the per-request rewritten
+			// URL, which can be noisy for path-rich backends.
+			otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
+				return "proxy upstream " + r.Method
+			}),
+		}
+		if p.Propagator != nil {
+			// Inject W3C traceparent explicitly so propagation does not depend
+			// on the global TextMapPropagator.
+			transportOpts = append(transportOpts, otelhttp.WithPropagators(p.Propagator))
+		}
+		roundTripper = otelhttp.NewTransport(tr, transportOpts...)
+	}
+
 	reverseProxy := &httputil.ReverseProxy{
-		Transport:     tr,
+		Transport:     roundTripper,
 		FlushInterval: -1,
 		ErrorHandler:  proxyErrorHandler(log, p.PortConfig),
 		Rewrite:       proxyRewrite(p.PortConfig, p.IdentityHeaders, httpPortStr, p.ProxyAuthToken),
@@ -278,7 +425,17 @@ func newPortProxy(p portProxyParams) *port {
 		limiter = newIPRateLimiter(rate.Limit(p.RateLimitRPS), p.RateLimitBurst)
 	}
 
-	handler := p.WhoisMiddleware(reverseProxy)
+	// Build the handler chain inside-out. spanAttrsMiddleware must sit INSIDE
+	// WhoisMiddleware so the tailnet user is already in the request context by
+	// the time it reads it, and INSIDE otelhttp.NewHandler so the server span
+	// is active. The resulting flow (outer→inner):
+	//   otelhttp → metrics → accessLog → rateLimit → whois → spanAttrs → reverseProxy
+	var inner http.Handler = reverseProxy
+	if p.TracerProvider != nil {
+		inner = spanAttrsMiddleware(p.ProxyName, p.PortName, p.PortConfig.GetFirstTarget())(reverseProxy)
+	}
+
+	handler := p.WhoisMiddleware(inner)
 
 	if limiter != nil {
 		handler = rateLimitMiddleware(limiter, handler)
@@ -293,11 +450,17 @@ func newPortProxy(p portProxyParams) *port {
 	}
 
 	if p.TracerProvider != nil {
-		handler = otelhttp.NewHandler(
-			handler, "proxy",
+		// otelhttp.NewHandler is the outermost wrapper: it creates the inbound
+		// server span that every inner middleware annotates. Read/write events
+		// give byte-level visibility for SSE/streaming bodies.
+		handlerOpts := []otelhttp.Option{
 			otelhttp.WithTracerProvider(p.TracerProvider),
 			otelhttp.WithMessageEvents(otelhttp.ReadEvents, otelhttp.WriteEvents),
-		)
+		}
+		if p.Propagator != nil {
+			handlerOpts = append(handlerOpts, otelhttp.WithPropagators(p.Propagator))
+		}
+		handler = otelhttp.NewHandler(handler, "proxy", handlerOpts...)
 	}
 
 	maxConns := p.MaxHTTPConns

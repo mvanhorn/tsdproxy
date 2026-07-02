@@ -21,6 +21,8 @@ import (
 	"github.com/moby/moby/client"
 	"github.com/rs/zerolog"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/almeidapaulopt/tsdproxy/grafana"
@@ -49,6 +51,7 @@ type WebApp struct {
 	assets         *web.Assets
 	httpServer     *http.Server
 	tracerProvider trace.TracerProvider
+	propagator     propagation.TextMapPropagator
 	tracerShutdown func(context.Context) error
 }
 
@@ -81,19 +84,21 @@ func InitializeApp() (*WebApp, error) {
 	health := core.NewHealthHandler(httpServer, logger)
 
 	var tracerProvider trace.TracerProvider
+	var propagator propagation.TextMapPropagator
 	var tracerShutdown func(context.Context) error
 	if cfg.Telemetry.Enabled {
-		tp, err := core.InitTracer(context.Background(), cfg.Telemetry.Endpoint, cfg.Telemetry.Insecure)
+		tp, prop, err := core.InitTracer(context.Background(), cfg.Telemetry.Endpoint, cfg.Telemetry.Insecure)
 		if err != nil {
 			logger.Error().Err(err).Msg("failed to initialize tracer")
 		} else {
 			tracerProvider = tp
+			propagator = prop
 			tracerShutdown = tp.Shutdown
 			logger.Info().Str("endpoint", cfg.Telemetry.Endpoint).Msg("OpenTelemetry tracer initialized")
 		}
 	}
 
-	proxymanager := pm.NewProxyManager(logger, cfg, proxyAuth.Token(), tracerProvider, assets)
+	proxymanager := pm.NewProxyManager(logger, cfg, proxyAuth.Token(), tracerProvider, propagator, assets)
 
 	dash := dashboard.NewDashboard(httpServer, logger, proxymanager, cfg)
 	dash.Start()
@@ -107,6 +112,7 @@ func InitializeApp() (*WebApp, error) {
 		Cfg:            cfg,
 		assets:         assets,
 		tracerProvider: tracerProvider,
+		propagator:     propagator,
 		tracerShutdown: tracerShutdown,
 	}
 	return webApp, nil
@@ -169,8 +175,23 @@ func (app *WebApp) Start() {
 		app.Log.Fatal().Err(err).Msg("failed to bind listener")
 	}
 
+	// Admin/management handler chain: logger, then (when tracing is enabled)
+	// an otelhttp server span so dashboard/API/health requests are traceable
+	// alongside proxy traffic. Operation name "admin" distinguishes these
+	// spans from the per-proxy "proxy" spans in the backend. The propagator is
+	// passed explicitly so trace-context injection does not depend on the
+	// global.
+	adminHandler := core.LoggerMiddleware(app.Log, app.HTTP.Mux)
+	if app.tracerProvider != nil {
+		adminHandler = otelhttp.NewHandler(
+			adminHandler, "admin",
+			otelhttp.WithTracerProvider(app.tracerProvider),
+			otelhttp.WithPropagators(app.propagator),
+		)
+	}
+
 	srv := http.Server{
-		Handler:           core.LoggerMiddleware(app.Log, app.HTTP.Mux),
+		Handler:           adminHandler,
 		Addr:              addr,
 		ReadHeaderTimeout: core.ReadHeaderTimeout,
 	}

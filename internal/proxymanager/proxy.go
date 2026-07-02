@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/almeidapaulopt/tsdproxy/internal/core/metrics"
@@ -73,6 +74,7 @@ type (
 		log                 zerolog.Logger
 		startedAt           time.Time
 		tracerProvider      trace.TracerProvider
+		propagator          propagation.TextMapPropagator
 		ctx                 context.Context
 		tlsProvider         tlsproviders.Provider
 		dnsProvider         dnsproviders.Provider
@@ -115,6 +117,7 @@ type ProxyParams struct {
 	Log            zerolog.Logger
 	ProxyProvider  proxyproviders.Provider
 	TracerProvider trace.TracerProvider
+	Propagator     propagation.TextMapPropagator
 	Config         *model.Config
 	Metrics        *metrics.Metrics
 	ProxyAuthToken string
@@ -162,6 +165,7 @@ func NewProxy(params ProxyParams) (*Proxy, error) {
 		startedAt:      time.Now(),
 		logBuffer:      logBuffer,
 		tracerProvider: params.TracerProvider,
+		propagator:     params.Propagator,
 		httpPort:       params.HTTPPort,
 		proxyAuthToken: params.ProxyAuthToken,
 		urlReady:       make(chan struct{}),
